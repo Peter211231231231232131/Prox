@@ -1,2 +1,3 @@
+aiohttp>=3.8.0
 websockets>=10.0
-aiohttp>=3.8.0  # For health check server
+cryptography>=3.4.8  # For Shadowsocks encryption (if implementing fully)
