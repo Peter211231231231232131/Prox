@@ -1,4 +1,4 @@
-#!/usr/env/bin python3
+#!/usr/bin/env python3
 import asyncio
 import logging
 import os
@@ -7,7 +7,7 @@ import time
 from urllib.parse import urlparse, parse_qs
 
 from aiohttp import web
-import websockets
+import websockets  # still imported but not used for pool connection now
 
 # ---------- Configuration ----------
 PROXY_TARGET = os.environ.get('PROXY_TARGET', 'pool.supportxmr.com:5555')
@@ -36,20 +36,7 @@ logger = logging.getLogger('obfuscated-proxy')
 active_connections = 0
 semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
 
-# ---------- Fake heartbeat generator ----------
-async def fake_heartbeat(ws, pool_ws):
-    """Send occasional fake messages to the miner to mimic a real service."""
-    while not ws.closed and not pool_ws.closed:
-        await asyncio.sleep(random.randint(30, 90))
-        try:
-            # Send a fake notification (e.g., JSON with keepalive)
-            fake_msg = '{"type":"ping","timestamp":%d}' % int(time.time())
-            await ws.send_str(fake_msg)
-            logger.debug("Sent fake heartbeat to miner")
-        except:
-            break
-
-# ---------- WebSocket handler (disguised as /api/v1/push) ----------
+# ---------- WebSocket handler (now forwards to plain TCP) ----------
 async def websocket_handler(request):
     global active_connections
     ws = web.WebSocketResponse()
@@ -69,49 +56,66 @@ async def websocket_handler(request):
         client = request.remote
         logger.info(f"New client: {client} | Active: {active_connections}")
 
+        # Parse pool host and port
+        pool_host, pool_port_str = PROXY_TARGET.split(':')
+        pool_port = int(pool_port_str)
+
+        # Connect to the mining pool via plain TCP (Stratum protocol)
         try:
-            # Connect to the actual mining pool (with a small random delay to avoid patterns)
-            await asyncio.sleep(random.uniform(0.1, 0.5))
-            pool_ws = await websockets.connect(f"ws://{PROXY_TARGET}")
+            pool_reader, pool_writer = await asyncio.open_connection(
+                pool_host, pool_port,
+                ssl=False  # pool.supportxmr.com:5555 is plain TCP
+            )
+            logger.info(f"Connected to pool {PROXY_TARGET} for {client}")
         except Exception as e:
-            logger.error(f"Pool connection failed: {e}")
+            logger.error(f"Pool connection failed for {client}: {e}")
             await ws.close()
             return ws
 
-        # Start fake heartbeat task
-        heartbeat_task = asyncio.create_task(fake_heartbeat(ws, pool_ws))
-
-        # Bidirectional forwarding
-        async def forward(src, dst, direction):
+        # Forward data between WebSocket and TCP socket
+        async def ws_to_tcp():
             try:
-                async for msg in src:
-                    if isinstance(msg, bytes):
-                        await dst.send_bytes(msg)
-                    else:
-                        await dst.send_str(msg)
-                    # Small random delay to mimic human traffic
-                    await asyncio.sleep(random.uniform(0.01, 0.05))
-            except:
-                pass
+                async for msg in ws:
+                    if msg.type == web.WSMsgType.BINARY:
+                        pool_writer.write(msg.data)
+                    elif msg.type == web.WSMsgType.TEXT:
+                        pool_writer.write(msg.data.encode())
+                    await pool_writer.drain()
+            except Exception as e:
+                logger.debug(f"ws_to_tcp error: {e}")
+            finally:
+                pool_writer.close()
+                await pool_writer.wait_closed()
 
-        task1 = asyncio.create_task(forward(ws, pool_ws, "→ pool"))
-        task2 = asyncio.create_task(forward(pool_ws, ws, "← client"))
+        async def tcp_to_ws():
+            try:
+                while True:
+                    data = await pool_reader.read(4096)
+                    if not data:
+                        break
+                    await ws.send_bytes(data)
+            except Exception as e:
+                logger.debug(f"tcp_to_ws error: {e}")
+            finally:
+                await ws.close()
 
-        # Wait for one to finish (connection closed)
+        # Run both forwarding tasks concurrently
+        task1 = asyncio.create_task(ws_to_tcp())
+        task2 = asyncio.create_task(tcp_to_ws())
+
         done, pending = await asyncio.wait(
-            [task1, task2, heartbeat_task],
+            [task1, task2],
             return_when=asyncio.FIRST_COMPLETED
         )
         for task in pending:
             task.cancel()
 
-        await pool_ws.close()
         active_connections -= 1
         logger.info(f"Client disconnected: {client} | Active: {active_connections}")
 
     return ws
 
-# ---------- Health check (returns JSON, like a real API) ----------
+# ---------- Health check endpoint ----------
 async def health_check(request):
     return web.json_response({
         "status": "healthy",
