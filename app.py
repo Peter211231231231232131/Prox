@@ -4,6 +4,7 @@ Mining Pool Proxy for Render
 Forward WebSocket connections from miners to actual pool with optional auth.
 """
 
+import asyncio
 import aiohttp
 from aiohttp import web
 import websockets
@@ -12,7 +13,6 @@ import os
 import ssl
 import json
 from urllib.parse import urlparse, parse_qs
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
