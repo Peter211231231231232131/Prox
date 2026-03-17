@@ -1,158 +1,107 @@
 #!/usr/bin/env python3
-"""
-Mining Pool Proxy for Render
-Forward WebSocket connections from miners to actual pool with optional auth.
-"""
-
 import asyncio
-import aiohttp
-from aiohttp import web
-import websockets
 import logging
 import os
 import ssl
-import json
 from urllib.parse import urlparse, parse_qs
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+
+from aiohttp import web
+import websockets
+
+# ---------- Configuration ----------
+PROXY_TARGET = os.environ.get('PROXY_TARGET', 'pool.supportxmr.com:5555')
+ACCESS_TOKEN = os.environ.get('ACCESS_TOKEN')          # Optional
+PORT = int(os.environ.get('PORT', 10000))              # Render sets this
+MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', 500))
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('mining-proxy')
 
-# Environment variables with defaults
-PROXY_TARGET = os.environ.get('PROXY_TARGET', 'pool.supportxmr.com:5555')
-ACCESS_TOKEN = os.environ.get('ACCESS_TOKEN', None)  # If set, require token
-LISTEN_PORT = int(os.environ.get('PORT', 8765))  # Render sets PORT
-USE_TLS = os.environ.get('USE_TLS', 'false').lower() == 'true'
-TLS_CERT = os.environ.get('TLS_CERT', '/etc/ssl/certs/cert.pem')
-TLS_KEY = os.environ.get('TLS_KEY', '/etc/ssl/private/key.pem')
-MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', 1000))
-CONNECTION_TIMEOUT = int(os.environ.get('CONNECTION_TIMEOUT', 600))  # 10 minutes
-
-# Connection counter
+# ---------- Connection tracking ----------
 active_connections = 0
-connection_semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
+semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
 
-async def forward_messages(reader, writer, direction):
-    """Bidirectional message forwarding with logging."""
-    try:
-        async for message in reader:
-            logger.debug(f"{direction}: {message[:100]}...")
-            await writer.send(message)
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"{direction} connection closed")
-    except Exception as e:
-        logger.error(f"Error in {direction}: {e}")
-
-async def handle_miner(websocket, path):
-    """Handle incoming miner connection."""
+# ---------- WebSocket handler ----------
+async def websocket_handler(request):
     global active_connections
-    
-    # Rate limiting via semaphore
-    async with connection_semaphore:
-        active_connections += 1
-        client_ip = websocket.remote_address[0]
-        logger.info(f"New connection from {client_ip}, active: {active_connections}")
-        
-        # Optional authentication via query string or headers
-        if ACCESS_TOKEN:
-            query = parse_qs(urlparse(path).query)
-            token = query.get('token', [None])[0]
-            auth_header = websocket.request_headers.get('Authorization', '')
-            if auth_header.startswith('Bearer '):
-                token = auth_header[7:]
-            
-            if token != ACCESS_TOKEN:
-                logger.warning(f"Authentication failed from {client_ip}")
-                await websocket.close(code=1008, reason='Unauthorized')
-                active_connections -= 1
-                return
-        
-        # Determine if target is TLS
-        target_uri = f"ws://{PROXY_TARGET}"
-        if PROXY_TARGET.endswith(':443') or 'wss://' in PROXY_TARGET:
-            target_uri = f"wss://{PROXY_TARGET}"
-        elif USE_TLS:
-            target_uri = f"wss://{PROXY_TARGET}"
-        else:
-            target_uri = f"ws://{PROXY_TARGET}"
-        
-        try:
-            # Connect to actual pool with timeout
-            async with asyncio.timeout(CONNECTION_TIMEOUT):
-                async with websockets.connect(
-                    target_uri,
-                    ping_interval=30,
-                    ping_timeout=10,
-                    close_timeout=5
-                ) as pool_ws:
-                    logger.info(f"Connected to pool {PROXY_TARGET} for {client_ip}")
-                    
-                    # Bidirectional forwarding
-                    task1 = asyncio.create_task(forward_messages(websocket, pool_ws, "Miner->Pool"))
-                    task2 = asyncio.create_task(forward_messages(pool_ws, websocket, "Pool->Miner"))
-                    
-                    # Wait for either task to complete (connection closed)
-                    done, pending = await asyncio.wait(
-                        [task1, task2],
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
-                    
-                    # Cancel the other task
-                    for task in pending:
-                        task.cancel()
-                    
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout connecting to pool for {client_ip}")
-            await websocket.close(code=1011, reason='Pool timeout')
-        except websockets.exceptions.WebSocketException as e:
-            logger.error(f"WebSocket error for {client_ip}: {e}")
-            await websocket.close(code=1011, reason='Pool error')
-        except Exception as e:
-            logger.error(f"Unexpected error for {client_ip}: {e}")
-            await websocket.close(code=1011, reason='Internal error')
-        finally:
-            active_connections -= 1
-            logger.info(f"Connection closed from {client_ip}, active: {active_connections}")
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
 
+    # Optional token authentication
+    if ACCESS_TOKEN:
+        query = parse_qs(request.query_string)
+        token = query.get('token', [None])[0]
+        if token != ACCESS_TOKEN:
+            logger.warning(f"Unauthorized attempt from {request.remote}")
+            await ws.close()
+            return ws
+
+    async with semaphore:
+        active_connections += 1
+        client = request.remote
+        logger.info(f"Connect: {client} | Active: {active_connections}")
+
+        try:
+            # Connect to the actual mining pool
+            pool_ws = await websockets.connect(f"ws://{PROXY_TARGET}")
+        except Exception as e:
+            logger.error(f"Failed to connect to pool {PROXY_TARGET}: {e}")
+            await ws.close()
+            return ws
+
+        # Bidirectional forwarding
+        async def forward(src, dst):
+            try:
+                async for msg in src:
+                    if isinstance(msg, bytes):
+                        await dst.send_bytes(msg)
+                    else:
+                        await dst.send_str(msg)
+            except:
+                pass
+
+        # Create two forwarding tasks
+        task1 = asyncio.create_task(forward(ws, pool_ws))
+        task2 = asyncio.create_task(forward(pool_ws, ws))
+
+        # Wait for one to finish (connection closed)
+        done, pending = await asyncio.wait(
+            [task1, task2],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+
+        await pool_ws.close()
+        active_connections -= 1
+        logger.info(f"Disconnect: {client} | Active: {active_connections}")
+
+    return ws
+
+# ---------- Health check endpoint ----------
 async def health_check(request):
-    """Simple HTTP health check endpoint."""
     return web.Response(text=f"OK - Active connections: {active_connections}")
 
+# ---------- Main ----------
 async def main():
-    """Start the WebSocket server."""
-    # Configure SSL if needed
-    ssl_context = None
-    if USE_TLS and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_context.load_cert_chain(TLS_CERT, TLS_KEY)
-        logger.info("TLS enabled")
-    
-    # Start server
-    server = await websockets.serve(
-        handle_miner,
-        "0.0.0.0",
-        LISTEN_PORT,
-        ssl=ssl_context,
-        ping_interval=30,
-        ping_timeout=10,
-        max_size=2**20  # 1MB max message
-    )
-    
-    logger.info(f"Proxy listening on port {LISTEN_PORT}" + (" with TLS" if ssl_context else ""))
-    
-    # Also run a tiny HTTP server for health checks
     app = web.Application()
-    app.router.add_get('/health', health_check)
+    app.router.add_get('/', websocket_handler)      # WebSocket upgrade at root
+    app.router.add_get('/health', health_check)     # Health check endpoint
+
+    # Optional: handle both / and /ws for flexibility
+    app.router.add_get('/ws', websocket_handler)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info("Health check server running on port 8080")
-    
+
+    logger.info(f"Proxy listening on port {PORT} (WebSocket + HTTP)")
+    logger.info(f"Forwarding to pool: {PROXY_TARGET}")
+
     # Keep running
-    await asyncio.Future()  # run forever
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
